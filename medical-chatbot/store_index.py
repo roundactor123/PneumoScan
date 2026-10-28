@@ -1,0 +1,99 @@
+"""
+store_index.py — Re-index PDF data into Pinecone with improved chunking
+========================================================================
+Run this script ONCE (or whenever you update your PDFs) to re-embed
+your documents with the optimized chunk size (1000 chars, 200 overlap).
+
+Usage:
+    python store_index.py
+"""
+
+import sys
+import os
+import time
+from dotenv import load_dotenv
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+load_dotenv()
+
+from src.helper import (
+    load_pdf_files,
+    text_split,
+    download_embeddings,
+)
+
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
+
+
+INDEX_NAME = "medical-chatbot"
+DATA_DIR = "data"
+
+
+def main():
+    """
+    Main orchestration function to re-index medical literature into Pinecone:
+      1. Loads all PDF medical textbooks from the data directory.
+      2. Chunks documents into 1000-character segments with 200-character overlap.
+      3. Loads the BAAI/bge-small-en-v1.5 embedding model.
+      4. Creates or resets the Pinecone serverless vector index.
+      5. Embeds and upserts all chunks to Pinecone for dense vector retrieval.
+    """
+    print("=" * 60)
+    print("  Pinecone Re-Indexing - Improved Chunking Strategy")
+    print("=" * 60)
+
+    # 1. Load PDFs
+    print(f"\n[1/5] Loading PDFs from '{DATA_DIR}'...")
+    documents = load_pdf_files(DATA_DIR)
+    print(f"      -> Loaded {len(documents)} pages")
+
+    # 2. Split
+    print("[2/5] Splitting documents (chunk_size=1000, overlap=200)...")
+    chunks = text_split(documents)
+    print(f"      -> Created {len(chunks)} chunks")
+
+    # 3. Embeddings
+    print("[3/5] Loading embedding model (BAAI/bge-small-en-v1.5)...")
+    embeddings = download_embeddings()
+
+    # 4. Pinecone setup
+    print(f"[4/5] Connecting to Pinecone index '{INDEX_NAME}'...")
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+
+    # Delete existing index to re-create with fresh data
+    if INDEX_NAME in pc.list_indexes().names():
+        print(f"      -> Deleting existing index '{INDEX_NAME}'...")
+        pc.delete_index(INDEX_NAME)
+
+    print(f"      -> Creating new index '{INDEX_NAME}'...")
+    pc.create_index(
+        name=INDEX_NAME,
+        dimension=384,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1"
+        )
+    )
+
+    while not pc.describe_index(INDEX_NAME).status['ready']:
+        time.sleep(1)
+
+    # 5. Upsert
+    print("[5/5] Embedding and upserting chunks to Pinecone...")
+    vector_store = PineconeVectorStore.from_documents(
+        documents=chunks,
+        index_name=INDEX_NAME,
+        embedding=embeddings,
+    )
+
+    print(f"\n{'=' * 60}")
+    print(f"  [OK] Done! {len(chunks)} chunks indexed into '{INDEX_NAME}'")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()

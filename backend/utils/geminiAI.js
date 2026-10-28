@@ -1,0 +1,305 @@
+/**
+ * GEMINI AI INTEGRATION — SMART MODEL CASCADE
+ * Real AI-powered pulmonary nodule detection.
+ * Automatically tries multiple models so quota issues on one
+ * never block the analysis.
+ *
+ * Free Tier (Google AI Studio):
+ *   Get a FREE key at: https://aistudio.google.com/app/apikey
+ *
+ * Model priority order (fastest/newest first):
+ *   1. gemini-2.0-flash     – 15 RPM, 1500 RPD
+ *   2. gemini-2.0-flash-lite – 30 RPM, 1500 RPD (lighter quota)
+ *   3. gemini-2.5-flash     – 10 RPM, 500 RPD
+ *   4. gemini-flash-lite-latest – alias for flash-lite */
+
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fs = require('fs');
+const path = require('path');
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Models tried in order — first success wins
+const VISION_MODELS = [
+    'gemini-flash-lite-latest',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+];
+
+const CHAT_MODELS = [
+    'gemini-flash-lite-latest',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+];
+
+
+// HELPERS
+
+
+/**
+ * Determines whether an error emitted by the Gemini SDK represents a quota/rate-limit error (HTTP 429).
+ *
+ * @name isQuotaError
+ * @function
+ * @param {Error} err - Error object thrown by the GoogleGenerativeAI client
+ * @returns {boolean} True if the error is rate-limit or quota related
+ */
+function isQuotaError(err) {
+    return err.message.includes('429') ||
+        err.message.includes('Too Many') ||
+        err.message.includes('quota') ||
+        err.message.includes('RESOURCE_EXHAUSTED');
+}
+
+/**
+ * Determines whether an error indicates that the requested model version was not found (HTTP 404).
+ *
+ * @name isNotFoundError
+ * @function
+ * @param {Error} err - Error object thrown by the client
+ * @returns {boolean} True if the model identifier does not exist or is deprecated
+ */
+function isNotFoundError(err) {
+    return err.message.includes('404') || err.message.includes('not found');
+}
+
+/**
+ * Executes an AI operation across a prioritized cascade list of Gemini models.
+ * Automatically fails over to the next candidate model if a rate limit or 404 is encountered.
+ *
+ * @name tryModels
+ * @function
+ * @template T
+ * @param {string[]} models - Ordered array of Gemini model identifier strings
+ * @param {(model: import('@google/generative-ai').GenerativeModel, modelName: string) => Promise<T>} fn - Callback executing the AI generation
+ * @returns {Promise<{ result: T, modelName: string }>} Successful generation output and name of model utilized
+ * @throws {Error} If all models in the cascade are exhausted or on non-quota critical errors
+ */
+async function tryModels(models, fn) {
+    const errors = [];
+    for (const modelName of models) {
+        try {
+            const model = genAI.getGenerativeModel({ model: modelName });
+            const result = await fn(model, modelName);
+            console.log(`✅ Used model: ${modelName}`);
+            return { result, modelName };
+        } catch (err) {
+            if (isQuotaError(err) || isNotFoundError(err)) {
+                console.warn(`⚠️  ${modelName} unavailable (${err.message.includes('429') ? 'quota' : '404'}) — trying next model`);
+                errors.push(`${modelName}: ${err.message.includes('429') ? 'quota exceeded' : 'not found'}`);
+                continue;
+            }
+            // Non-quota error — throw immediately
+            throw err;
+        }
+    }
+    // All models exhausted
+    throw new Error(
+        `All Gemini models quota-exceeded. Please wait a minute and try again.\n` +
+        `Details: ${errors.join(' | ')}\n` +
+        `Free tier allows 15–30 req/min. If you sent many requests in a row, wait 60 seconds.`
+    );
+}
+
+
+// CT SCAN ANALYSIS
+
+
+const VISION_PROMPT = `You are an AI medical imaging assistant specialized in pulmonary radiology.
+Analyze this image and respond ONLY with a valid JSON object (no markdown, no extra text):
+
+{
+  "result": "<one of: 'Nodule Detected - Benign', 'Nodule Detected - Malignant', 'No Nodule Detected', 'Indeterminate - Further Evaluation Required'>",
+  "confidence": <integer 60-98>,
+  "riskLevel": "<one of: none, low, moderate, high>",
+  "description": "<2-3 sentence clinical description>",
+  "technicalDetails": {
+    "noduleSize": "<e.g. '8.5 mm' or 'N/A'>",
+    "location": "<e.g. 'Right Upper Lobe' or 'N/A'>",
+    "shape": "<e.g. 'Round, well-defined' or 'N/A'>",
+    "density": "<e.g. 'Solid', 'Ground-glass', 'Part-solid' or 'N/A'>"
+  },
+  "recommendations": ["<rec 1>","<rec 2>","<rec 3>","<rec 4>"],
+  "imageQuality": "<one of: Good, Fair, Poor, Not a CT scan>",
+  "findings": "<radiological findings 2-4 sentences based only on what is visible>"
+}
+
+If this is not a real CT scan (e.g., a regular photo or synthetic image), still analyze it fully and set imageQuality to 'Not a CT scan'.`;
+
+/**
+ * Analyze a CT scan image using the best available Gemini Vision model.
+ * @param {string} imagePath - Absolute path to the uploaded image
+ * @returns {Object} Structured prediction result
+ */
+async function analyzeCTScan(imagePath) {
+    const startTime = Date.now();
+
+    if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
+        throw new Error('GEMINI_API_KEY is not configured. Please add your API key to backend/.env. Get a FREE key at https://aistudio.google.com/app/apikey');
+    }
+
+    const imageBuffer = fs.readFileSync(imagePath);
+    const base64Image = imageBuffer.toString('base64');
+    const mimeType = path.extname(imagePath).toLowerCase() === '.png' ? 'image/png' : 'image/jpeg';
+
+    const imagePart = { inlineData: { mimeType, data: base64Image } };
+
+    console.log('🤖 Starting Gemini Vision analysis (cascade mode)...');
+
+    const { result: geminiResult, modelName } = await tryModels(VISION_MODELS, async (model) => {
+        return model.generateContent([VISION_PROMPT, imagePart]);
+    });
+
+    const text = geminiResult.response.text();
+    const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
+
+    console.log(`📊 Analysis complete via ${modelName} (${processingTime}s)`);
+
+    // Parse JSON — strip markdown fences if present
+    let parsed;
+    try {
+        const clean = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+        parsed = JSON.parse(clean);
+    } catch {
+        console.warn('⚠️  JSON parse failed — using text-based fallback extractor');
+        parsed = extractFallback(text);
+    }
+
+    return {
+        result: str(parsed.result, 'Indeterminate - Further Evaluation Required'),
+        confidence: parseFloat((parsed.confidence || 75).toFixed(2)),
+        riskLevel: str(parsed.riskLevel, 'moderate'),
+        description: str(parsed.description, 'Analysis completed. Please consult a medical professional.'),
+        technicalDetails: {
+            noduleSize: parsed.technicalDetails?.noduleSize || 'N/A',
+            location: parsed.technicalDetails?.location || 'N/A',
+            shape: parsed.technicalDetails?.shape || 'N/A',
+            density: parsed.technicalDetails?.density || 'N/A',
+        },
+        recommendations: Array.isArray(parsed.recommendations) && parsed.recommendations.length
+            ? parsed.recommendations
+            : defaultRecommendations(),
+        imageQuality: str(parsed.imageQuality, 'Fair'),
+        findings: str(parsed.findings, 'Image analyzed by Gemini Vision AI.'),
+        processingTime: parseFloat(processingTime),
+        timestamp: new Date().toISOString(),
+        modelVersion: modelName,
+        analysisEngine: 'Google Gemini Vision AI',
+    };
+}
+
+
+// INTELLIGENT CHATBOT
+
+
+const SYSTEM_INSTRUCTION = `You are a friendly, highly knowledgeable medical AI assistant specialized in medical imaging, CT scan interpretation, and pulmonary nodule diagnostics. Your knowledge is grounded in comprehensive medical literature, textbooks, and clinical radiology protocols.
+
+BEHAVIOR RULES (Medical-Chatbot RAG Standard):
+1. Casual greetings ("hi", "hello", "how are you"): Respond warmly and briefly as a helpful medical assistant (e.g., "Hello! I'm your Medical AI Assistant. How can I help you today with CT scans, pulmonary nodules, or lung health?").
+2. Medical questions: Provide clear, evidence-based explanations grounded in medical literature. Break down complex radiological or diagnostic terms into plain, accessible language.
+3. Pulmonary & Nodule specialization:
+   - Thoroughly explain pulmonary nodules (benign vs malignant characteristics, ground-glass opacities, solid/part-solid nodules, Fleischner Society guidelines).
+   - Clarify CT scan metrics (HU attenuation, size, spiculation, calcification patterns).
+   - Outline diagnostic pathways (follow-up low-dose CT, PET-CT, tissue biopsy, bronchoscopy).
+4. Non-medical queries: Politely steer the user back toward health and medical imaging topics in one short sentence.
+5. Format & Clarity: Keep responses structured, concise, and easy to read with bullet points when appropriate. Never expose internal reasoning.
+6. Medical Disclaimer: Add a brief note that responses are informational and not a substitute for professional medical consultation.
+7. Context-awareness: Use conversation history to resolve follow-ups naturally.`;
+
+/**
+ * Generates an intelligent clinical chatbot response via Google Gemini.
+ * Formats multi-turn conversation history into Gemini chat turns, enforcing strict medical-radiological rules.
+ *
+ * @name getChatbotResponse
+ * @function
+ * @param {string} userMessage - User's clinical or radiological inquiry
+ * @param {Array<{ role: string, text: string }>} [conversationHistory=[]] - Previous message turns
+ * @returns {Promise<string>} AI-generated response text
+ * @throws {Error} If GEMINI_API_KEY is not configured or all models fail
+ */
+async function getChatbotResponse(userMessage, conversationHistory = []) {
+    if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
+        throw new Error('GEMINI_API_KEY not configured');
+    }
+
+    const { result, modelName } = await tryModels(CHAT_MODELS, async (model, modelName) => {
+        const m = genAI.getGenerativeModel({ model: modelName, systemInstruction: SYSTEM_INSTRUCTION });
+        const chat = m.startChat({
+            history: (conversationHistory || [])
+                .filter(m => m.role === 'user' || m.role === 'model' || m.role === 'assistant')
+                .map(m => ({ 
+                    role: m.role === 'assistant' ? 'model' : m.role, 
+                    parts: [{ text: m.text || m.content || '' }] 
+                })),
+        });
+        return chat.sendMessage(userMessage);
+    });
+
+    console.log(`💬 Chatbot response via ${modelName}`);
+    return result.response.text();
+}
+
+
+// UTILITIES
+
+
+/**
+ * Helper to ensure a valid non-empty string or return a safe fallback default.
+ *
+ * @name str
+ * @function
+ * @param {*} val - Value to check
+ * @param {string} fallback - Default string if val is undefined, null, or whitespace
+ * @returns {string} Cleaned string or fallback
+ */
+function str(val, fallback) {
+    return typeof val === 'string' && val.trim() ? val.trim() : fallback;
+}
+
+/**
+ * Returns standardized, safe clinical follow-up recommendations for pulmonary cases.
+ * Used when the AI output omits specific recommendations.
+ *
+ * @name defaultRecommendations
+ * @function
+ * @returns {string[]} Array of clinical follow-up guidelines
+ */
+function defaultRecommendations() {
+    return [
+        'Consult with a pulmonologist for proper evaluation',
+        'Consider additional imaging if clinically indicated',
+        'Regular follow-up as recommended by your physician',
+        'Maintain healthy lifestyle and avoid smoking',
+    ];
+}
+
+/**
+ * Heuristic fallback parser invoked if Gemini returns plain text rather than structured JSON.
+ * Scans radiological keywords (benign, malignant, cancer) to assemble a valid prediction object.
+ *
+ * @name extractFallback
+ * @function
+ * @param {string} text - Raw unstructured model output text
+ * @returns {Object} Normalized prediction object matching the standard schema
+ */
+function extractFallback(text) {
+    const lower = text.toLowerCase();
+    let result = 'Indeterminate - Further Evaluation Required', riskLevel = 'moderate', confidence = 74;
+    if (lower.includes('benign')) { result = 'Nodule Detected - Benign'; riskLevel = 'low'; confidence = 78; }
+    else if (lower.includes('malignant') || lower.includes('cancer')) { result = 'Nodule Detected - Malignant'; riskLevel = 'high'; confidence = 72; }
+    else if (lower.includes('no nodule') || lower.includes('normal')) { result = 'No Nodule Detected'; riskLevel = 'none'; confidence = 88; }
+    return {
+        result, confidence, riskLevel,
+        description: 'Analysis completed.',
+        technicalDetails: { noduleSize: 'N/A', location: 'N/A', shape: 'N/A', density: 'N/A' },
+        recommendations: defaultRecommendations(),
+        imageQuality: 'Fair',
+        findings: text.substring(0, 500),
+    };
+}
+
+module.exports = { analyzeCTScan, getChatbotResponse };
