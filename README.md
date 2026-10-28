@@ -241,5 +241,3 @@ PneumoScan is developed strictly for **educational, research, and diagnostic ass
 
 ## 📄 License
 This project is open-source software licensed under the [MIT License](LICENSE).
-#   P n e u m o S c a n  
- 
